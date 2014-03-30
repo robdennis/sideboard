@@ -9,39 +9,15 @@ from datetime import datetime, timedelta
 
 from ws4py.client.threadedclient import WebSocketClient
 
-from sideboard import threads
-from rpctools.jsonrpc import ServerProxy
-
-from sideboard.lib import log, config, stopped, on_startup, on_shutdown
-
-
-class SubscriptionJsonrpc(ServerProxy):
-    """
-    Subclass of rpctools.jsonrpc.ServerProxy which automatically fills in the
-    relevant values for the source you're subscribing to as they appear in the
-    Sideboard config file
-
-    >>> SubscriptionJsonrpc().authenticate('username', 'password')
-    True
-    """
-    def __init__(self):
-        for setting in ['client_key', 'client_cert', 'ca']:
-            if config['subscription'][setting]:
-                assert os.path.exists(config['subscription'][setting]), '{} option in [subscription] config section set to path not found on the filesystem: {}'.format(setting, config['subscription'][setting])
-
-        ServerProxy.__init__(self,
-                             config['subscription']['jsonrpc_url'],
-                             key_file=config['subscription']['client_key'],
-                             cert_file=config['subscription']['client_cert'],
-                             ca_certs=config['subscription']['ca'],
-                             validate_cert_hostname=bool(config['subscription']['ca']))
+import sideboard.lib
+from sideboard.lib import log, config, stopped, on_startup, on_shutdown, DaemonTask, Caller
 
 
 class _WebSocketClientDispatcher(WebSocketClient):
-    def __init__(self, dispatcher, url):
+    def __init__(self, dispatcher, url, ssl_opts=None):
         self.connected = False
         self.dispatcher = dispatcher
-        WebSocketClient.__init__(self, url)
+        WebSocketClient.__init__(self, url, ssl_options=ssl_opts)
 
     def pre_connect(self):
         pass
@@ -70,14 +46,14 @@ class _WebSocketClientDispatcher(WebSocketClient):
         return WebSocketClient.send(self, data)
 
     def received_message(self, message):
-        s = str(message)
-        log.debug('received {!r}', s)
+        message = str(message)
+        log.debug('received {!r}', message)
         try:
-            parsed = json.loads(s)
+            message = json.loads(message)
         except:
-            log.error('failed to parse incoming message', exc_info=True)
-        else:
-            self.dispatcher.defer(parsed)
+            log.warn('failed to parse incoming message', exc_info=True)
+        finally:
+            self.dispatcher.defer(message)
 
 
 class WebSocket(object):
@@ -89,25 +65,22 @@ class WebSocket(object):
         asynchronous subscription calls with callbacks
     - adding locking to make sending messages thread-safe
     """
-    default_url = None
     poll_method = 'sideboard.poll'
     WebSocketDispatcher = _WebSocketClientDispatcher
 
-    def __init__(self, url=None):
+    def __init__(self, url=None, ssl_opts=None, connect_immediately=True, max_wait=2):
         self.ws = None
-        self.url = url or self.default_url
-        assert self.url, 'no url or default url provided'
+        self.url = url or 'ws://localhost:{}/wsrpc'.format(config['cherrypy']['server.socket_port'])
         self._lock = RLock()
         self._callbacks = {}
         self._counter = count()
+        self.ssl_opts = ssl_opts
         self._reconnect_attempts = 0
         self._last_poll, self._last_reconnect_attempt = None, None
-        self._checker = threads.DaemonTask(self._check, interval=1)
-        self._dispatcher = threads.Caller(self._dispatch, threads=1)
-        self._dispatcher.start()
-        self._checker.start()
-        on_shutdown(self._checker.stop)
-        on_shutdown(self._dispatcher.stop)
+        self._dispatcher = Caller(self._dispatch, threads=1)
+        self._checker = DaemonTask(self._check, interval=1)
+        if connect_immediately:
+            self.connect(max_wait=max_wait)
 
     def __enter__(self):
         return self
@@ -133,21 +106,20 @@ class WebSocket(object):
             self._poll()
 
     def _poll(self):
-        with self._lock:
-            assert self.ws and self.ws.connected, 'cannot poll while websocket is not connected'
-            try:
-                self.call(self.poll_method)
-            except:
-                log.error('no poll response received from {!r}, closing connection, will attempt to reconnect', self.url, exc_info=True)
-                self.ws.close()
-            else:
-                self._last_poll = datetime.now()
+        assert self.ws and self.ws.connected, 'cannot poll while websocket is not connected'
+        try:
+            self.call(self.poll_method)
+        except:
+            log.error('no poll response received from {!r}, closing connection, will attempt to reconnect', self.url, exc_info=True)
+            self.ws.close()
+        else:
+            self._last_poll = datetime.now()
 
     def _reconnect(self):
         with self._lock:
             assert not self.connected, 'connection is still active'
             try:
-                self.ws = self.WebSocketDispatcher(self._dispatcher, self.url)
+                self.ws = self.WebSocketDispatcher(self._dispatcher, self.url, ssl_opts=self.ssl_opts)
                 self.ws.connect()
             except Exception as e:
                 log.warn('failed to connect to {}: {}', self.url, str(e))
@@ -178,18 +150,39 @@ class WebSocket(object):
 
     def _dispatch(self, message):
         log.debug('dispatching {}', message)
-        assert 'client' in message or 'callback' in message, 'no callback or client in message {}'.format(message)
-        id = message.get('client') or message.get('callback')
-        assert id in self._callbacks, 'unknown dispatchee {}'.format(id)
-        if 'error' in message:
-            self._callbacks[id]['errback'](message['error'])
+        try:
+            assert isinstance(message, dict), 'incoming message is not a dictionary'
+            assert 'client' in message or 'callback' in message, 'no callback or client in message {}'.format(message)
+            id = message.get('client') or message.get('callback')
+            assert id in self._callbacks, 'unknown dispatchee {}'.format(id)
+        except AssertionError:
+            self.fallback(message)
         else:
-            self._callbacks[id]['callback'](message.get('data'))
+            if 'error' in message:
+                self._callbacks[id]['errback'](message['error'])
+            else:
+                self._callbacks[id]['callback'](message.get('data'))
+
+    def fallback(self, message):
+        log.error('no callback registered for message {!r}', message, exc_info=True)
+        raise
 
     @property
     def connected(self):
         """boolean indicating whether or not this connection is currently active"""
         return bool(self.ws) and self.ws.connected
+
+    def connect(self, max_wait=0):
+        self._checker.start()
+        self._dispatcher.start()
+        for i in range(10 * max_wait):
+            if not self.connected:
+                stopped.wait(0.1)
+            else:
+                break
+        else:
+            if max_wait:
+                log.warn('websocket {!r} not connected after {} seconds', self.url, max_wait)
 
     def close(self):
         """
@@ -251,7 +244,8 @@ class WebSocket(object):
         >>> ws.unsubscribe(client)
         """
         self._callbacks.pop(client, None)
-        self._send(action='unsubscribe', client=client)
+        if self.connected:
+            self._send(action='unsubscribe', client=client)
 
     def call(self, method, *args, **kwargs):
         """
@@ -281,6 +275,17 @@ class WebSocket(object):
         assert not stopped.is_set(), 'websocket closed before response was received'
         assert result, error[0] if error else 'no response received for 10 seconds'
         return result[0]
+
+    def make_caller(self, method):
+        """
+        Returns a function which calls the specified method; useful for creating
+        callbacks, e.g.
+        
+        >>> authenticate = ws.make_caller('auth.authenticate')
+        >>> authenticate('username', 'password')
+        True
+        """
+        return lambda *args, **kwargs: self.call(method, *args, **kwargs)
 
 
 class Model(MutableMapping):
@@ -378,44 +383,45 @@ class Model(MutableMapping):
 class Subscription(object):
     """
     Utility class for opening a websocket to a given destination, subscribing to an rpc call,
-    and processing the response.  Simply inherit from this class and define a "callback" method:
-    
+    and processing the response.
+
+    >>> logged_in_users = Subscription('admin.get_logged_in_users')
+    >>> logged_in_users.result  # this will always be the latest return value of your rpc method
+
+    If you want to do postprocessing on the results, you can override the "callback" method:
+
     >>> class UserList(Subscription):
     ...     def __init__(self):
-    ...         self.cache = []
-    ...         Subscription.__init__(self, 'remote_method.get_logged_in_users')
+    ...         self.usernames = []
+    ...         Subscription.__init__(self, 'admin.get_logged_in_users')
     ...     
     ...     def callback(self, users):
-    ...         self.cache = users
+    ...         self.usernames = [user['username'] for user in users]
     ... 
     >>> users = UserList()
-    
-    The above code gives you a "users" object with a "cache" attribute; when
-    Sideboard starts, it will open a websocket connection to your intended plugin
-    and call the 'remote_method.get_logged_in_users' method, and the "callback" function
-    will be called on every response.
-    """
-    WebSocketClient = WebSocket
-    """
-    override this with a WebSocket whose default url is the destination
-    to which you wish for this Subscription to connect
+
+    The above code gives you a "users" object with a "usernames" attribute; when Sideboard
+    starts, it opens a websocket connection to whichever remote server defines the "admin"
+    service (as defined in the rpc_services config section), then subscribes the the 
+    "admin.get_logged_in_users" method and calls the "callback" methon on every response.
     """
 
     def __init__(self, rpc_method, *args, **kwargs):
-        self.ws = None
+        self.result = None
+        connect_immediately = kwargs.pop('connect_immediately', False)
         self.method, self.args, self.kwargs = rpc_method, args, kwargs
-        on_startup(self.connect)
-        on_shutdown(self.disconnect)
+        self.ws = sideboard.lib.services.get_websocket(rpc_method.split('.')[0])
+        on_startup(self._subscribe)
+        on_shutdown(self._unsubscribe)
+        if connect_immediately:
+            self.ws.connect(max_wait=2)
+            self._subscribe()
 
-    def connect(self):
-        if not self.ws:
-            self.ws = self.WebSocketClient()
-            self.client = self.ws.subscribe(self.callback, self.method, *self.args, **self.kwargs)
-        else:
-            self.ws.connect()
+    def _subscribe(self):
+        self._client_id = self.ws.subscribe(self._callback, self.method, *self.args, **self.kwargs)
 
-    def disconnect(self):
-        self.ws.close()
+    def _unsubscribe(self):
+        self.ws.unsubscribe(self._client_id)
 
     def refresh(self):
         """
@@ -423,9 +429,13 @@ class Subscription(object):
         the response; this will manually check for changes if you are
         subscribed to a method which by design doesn't re-fire on every change
         """
-        assert self.ws and self.ws.connected, 'cannot refresh {}: websocket not connected'.format(self.method)
-        self.callback(self.ws.call(self.method, *self.args, **self.kwargs))
+        assert self.ws.connected, 'cannot refresh {}: websocket not connected'.format(self.method)
+        self._callback(self.ws.call(self.method, *self.args, **self.kwargs))
+
+    def _callback(self, response_data):
+        self.result = response_data
+        self.callback(response_data)
 
     def callback(self, response_data):
-        """override this to define what to do with your method return values"""
-        raise NotImplemented('subclasses must implement a callback method')
+        """override this to define what to do with your rpc method return values"""
+        pass
