@@ -1,9 +1,10 @@
 from __future__ import unicode_literals
 import os
+import ssl
 import sys
 
-import ldap
 import cherrypy
+import ldap3
 
 import sideboard
 from sideboard.internal import connection_checker
@@ -20,43 +21,51 @@ def jsonrpc_auth(body):
 def ldap_auth(username, password):
     if not username or not password:
         return False
-    
+
     try:
-        conn = ldap.initialize(config['ldap.url'])
-        
-        force_start_tls = False
-        if config['ldap.cacert']:
-            ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, config['ldap.cacert'])
-            force_start_tls = True
-            
-        if config['ldap.cert']:
-            ldap.set_option(ldap.OPT_X_TLS_CERTFILE, config['ldap.cert'])
-            force_start_tls = True
-            
-        if config['ldap.key']:
-            ldap.set_option(ldap.OPT_X_TLS_KEYFILE, config['ldap.key'])
-            force_start_tls = True
-    
-        if force_start_tls:
-            conn.start_tls_s()
+        ssl_material = (
+            config['ldap.cacert'], config['ldap.cert'], config['ldap.key']
+        )
+        server_kwargs = {}
+        tls_kwargs = {}
+
+        if config['ldap.url'].startswith('ldaps') or any(ssl_material):
+            server_kwargs['use_ssl'] = True
         else:
-            conn.set_option(ldap.OPT_X_TLS_DEMAND, config['ldap.start_tls'])
+            server_kwargs['use_ssl'] = False
+        server_kwargs['host'] = config['ldap.url']
+
+        if config['ldap.cacert']:
+            tls_kwargs['ca_certs_file'] = config['ldap.cacert']
+            # if we specify a CA certs file, assume we want to validate it
+            tls_kwargs['validate'] = ssl.CERT_REQUIRED
+
+        if tls_kwargs:
+            server_kwargs['tls'] = ldap3.Tls(**tls_kwargs)
+
+        server = ldap3.Server(**server_kwargs)
+
     except:
-        log.error('Error initializing LDAP connection', exc_info=True)
+        log.error('Error initializing LDAP server', exc_info=True)
         raise
-    
+
+    # attempt to bind on each base DN that was configured
     for basedn in listify(config['ldap.basedn']):
         dn = '{}={},{}'.format(config['ldap.userattr'], username, basedn)
         log.debug('attempting to bind with dn {}', dn)
         try:
-            conn.simple_bind_s(dn, password)
-        except ldap.INVALID_CREDENTIALS as x:
-            continue
+            connection = ldap3.Connection(server, user=dn, password=password)
+            connection.start_tls()
+            is_bound = connection.bind()
         except:
             log.warning("Error binding to LDAP server with dn", exc_info=True)
             raise
-        else:
+
+        if is_bound:
             return True
+
+    # we couldn't auth on anything
+    return False
 
 
 @render_with_templates(config['template_dir'])
